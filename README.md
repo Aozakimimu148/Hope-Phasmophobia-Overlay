@@ -52,9 +52,9 @@ Don't guess. Know.
 ### Global Hotkeys
 | Key | Function |
 | :--- | :--- |
-| **F9** | Start / Restart Crucifix Timer (0:25) |
+| **F7** | Start / Restart Crucifix Timer (0:25) |
+| **F8** | Stop / Reset Smudge Timer 
 | **F9** | Start / Restart Smudge Timer (3:00) |
-| **F8** | Stop / Reset Smudge Timer |
 | **F10** | Tap for Ghost Speed (BPM) |
 | **F11** | Reset Speed / Pacer |
 | **Alt + 1-8** | Toggle Evidence (EMF, Box, Fingerprints, etc.) |
