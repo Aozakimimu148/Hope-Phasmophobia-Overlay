@@ -1,53 +1,35 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.ComponentModel;
+using System.Diagnostics;
 using System.Linq;
 using System.Runtime.InteropServices;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
+// Removed Windows.Input to prevent conflict with native methods
 using System.Windows.Interop;
 using System.Windows.Media;
 using System.Windows.Threading;
-using System.Diagnostics;
 
 namespace Hophesmoverlay
 {
     public partial class MainWindow : Window
     {
-        [DllImport("user32.dll")] private static extern bool RegisterHotKey(IntPtr hWnd, int id, uint fsModifiers, uint vk);
-        [DllImport("user32.dll")] private static extern bool UnregisterHotKey(IntPtr hWnd, int id);
+        // --- LOW LEVEL HOOK SETTINGS ---
+        private const int WH_KEYBOARD_LL = 13;
+        private const int WM_KEYDOWN = 0x0100;
+        private const int WM_SYSKEYDOWN = 0x0104;
 
-        private const int HOTKEY_SMUDGE_START = 9001; // F9
-        private const int HOTKEY_SMUDGE_STOP = 9005;  // F8
-        private const int HOTKEY_BPM_TAP = 9002;      // F10
-        private const int HOTKEY_BPM_RESET = 9006;    // F11
-        private const int HOTKEY_MINI = 9003;         // Insert
-        private const int HOTKEY_INTEL = 9004;        // Home
-        private const int HOTKEY_BASE_EV = 9010;
+        // --- VIRTUAL KEYS ---
+        private const int VK_LMENU = 0xA4; // Left Alt
+        private const int VK_RMENU = 0xA5; // Right Alt
+        private const int VK_MENU = 0x12;  // Alt (General)
 
-        // NEW HOTKEYS
-        private const int HOTKEY_HUNT_CD = 9020;      // F7
-        private const int HOTKEY_RESET_EVIDENCE = 9021; // Alt + 8
-
-        private const int WM_HOTKEY = 0x0312;
-
-        public List<Ghost> AllGhosts { get; set; }
-        private DispatcherTimer _smudgeTimer;
-        private int _timerSecondsRemaining = 180;
-
-        // NEW HUNT CD TIMER
-        private DispatcherTimer _huntTimer;
-        private int _huntTimerSeconds = 25;
-
-        private List<DateTime> _tapHistory = new List<DateTime>();
-        private double _speedMultiplier = 1.0;
-        private int _currentView = 0;
-
-        private readonly List<string> _fastGhosts = new List<string> { "Jinn", "Revenant", "Hantu", "The Twins", "Raiju", "Moroi", "Deogen", "Thaye", "The Mimic" };
-        private readonly List<string> _slowGhosts = new List<string> { "Revenant", "Hantu", "Deogen", "Thaye", "The Mimic", "The Twins", "Moroi" };
-        private string _currentSpeedCategory = "None";
+        private static LowLevelKeyboardProc _proc = HookCallback;
+        private static IntPtr _hookID = IntPtr.Zero;
+        private LowLevelKeyboardProc _procReference; // Keep reference alive
 
         public MainWindow()
         {
@@ -56,74 +38,110 @@ namespace Hophesmoverlay
             GhostsListControl.ItemsSource = AllGhosts;
             GhostsIntelControl.ItemsSource = AllGhosts;
 
-            // Smudge Timer
             _smudgeTimer = new DispatcherTimer(DispatcherPriority.Render);
             _smudgeTimer.Interval = TimeSpan.FromSeconds(1);
             _smudgeTimer.Tick += SmudgeTimer_Tick;
 
-            // Hunt CD Timer
             _huntTimer = new DispatcherTimer(DispatcherPriority.Render);
             _huntTimer.Interval = TimeSpan.FromSeconds(1);
             _huntTimer.Tick += HuntTimer_Tick;
-        }
 
-        private void BtnDonate_Click(object sender, RoutedEventArgs e) { try { Process.Start(new ProcessStartInfo { FileName = "https://ko-fi.com/hopesan", UseShellExecute = true }); } catch { } }
-
-        protected override void OnSourceInitialized(EventArgs e)
-        {
-            base.OnSourceInitialized(e);
-            IntPtr handle = new WindowInteropHelper(this).Handle;
-            HwndSource source = HwndSource.FromHwnd(handle);
-            source.AddHook(HwndHook);
-
-            // TIMERS
-            RegisterHotKey(handle, HOTKEY_SMUDGE_START, 0, 0x78); // F9
-            RegisterHotKey(handle, HOTKEY_SMUDGE_STOP, 0, 0x77);  // F8
-            RegisterHotKey(handle, HOTKEY_HUNT_CD, 0, 0x76);      // F7 (NEW)
-
-            // PACER
-            RegisterHotKey(handle, HOTKEY_BPM_TAP, 0, 0x79);      // F10
-            RegisterHotKey(handle, HOTKEY_BPM_RESET, 0, 0x7A);    // F11
-
-            // VIEWS
-            RegisterHotKey(handle, HOTKEY_MINI, 0, 0x2D);         // Insert
-            RegisterHotKey(handle, HOTKEY_INTEL, 0, 0x24);        // Home
-
-            // EVIDENCE (Alt+1-7)
-            for (int i = 1; i <= 7; i++) RegisterHotKey(handle, HOTKEY_BASE_EV + i, 0x0001, (uint)(0x30 + i));
-
-            // RESET EVIDENCE (Alt+8)
-            RegisterHotKey(handle, HOTKEY_RESET_EVIDENCE, 0x0001, 0x38); // Alt+8
+            // Setup Hook
+            _procReference = HookCallback;
+            _hookID = SetHook(_procReference);
         }
 
         protected override void OnClosed(EventArgs e)
         {
-            IntPtr handle = new WindowInteropHelper(this).Handle;
-            // Unregister all loops
-            UnregisterHotKey(handle, HOTKEY_SMUDGE_START); UnregisterHotKey(handle, HOTKEY_SMUDGE_STOP); UnregisterHotKey(handle, HOTKEY_HUNT_CD);
-            UnregisterHotKey(handle, HOTKEY_BPM_TAP); UnregisterHotKey(handle, HOTKEY_BPM_RESET); UnregisterHotKey(handle, HOTKEY_RESET_EVIDENCE);
-            UnregisterHotKey(handle, HOTKEY_MINI); UnregisterHotKey(handle, HOTKEY_INTEL);
-            for (int i = 1; i <= 7; i++) UnregisterHotKey(handle, HOTKEY_BASE_EV + i);
+            UnhookWindowsHookEx(_hookID);
             base.OnClosed(e);
         }
 
-        private IntPtr HwndHook(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)
+        private static IntPtr SetHook(LowLevelKeyboardProc proc)
         {
-            if (msg == WM_HOTKEY)
+            using (Process curProcess = Process.GetCurrentProcess())
+            using (ProcessModule curModule = curProcess.MainModule)
             {
-                int id = wParam.ToInt32();
-                if (id == HOTKEY_SMUDGE_START) ResetSmudgeTimer();
-                else if (id == HOTKEY_SMUDGE_STOP) StopSmudgeTimer();
-                else if (id == HOTKEY_HUNT_CD) ResetHuntTimer(); // F7 logic
-                else if (id == HOTKEY_BPM_TAP) CalculateBPM();
-                else if (id == HOTKEY_BPM_RESET) ResetPace();
-                else if (id == HOTKEY_RESET_EVIDENCE) ResetEvidence(); // Alt+8 Logic
-                else if (id == HOTKEY_MINI) SetViewMode(1);
-                else if (id == HOTKEY_INTEL) SetViewMode(2);
-                else if (id > HOTKEY_BASE_EV && id <= HOTKEY_BASE_EV + 7) ToggleEvidenceByIndex(id - HOTKEY_BASE_EV);
+                return SetWindowsHookEx(WH_KEYBOARD_LL, proc, GetModuleHandle(curModule.ModuleName), 0);
             }
-            return IntPtr.Zero;
         }
+
+        private delegate IntPtr LowLevelKeyboardProc(int nCode, IntPtr wParam, IntPtr lParam);
+
+        // --- THE NEW ROBUST HOOK CALLBACK ---
+        private static IntPtr HookCallback(int nCode, IntPtr wParam, IntPtr lParam)
+        {
+            if (nCode >= 0 && (wParam == (IntPtr)WM_KEYDOWN || wParam == (IntPtr)WM_SYSKEYDOWN))
+            {
+                int vkCode = Marshal.ReadInt32(lParam);
+
+                // Get Window
+                var wnd = Application.Current.MainWindow as MainWindow;
+
+                if (wnd != null)
+                {
+                    // 1. Check for ALT Key State using Native Method (More reliable while gaming)
+                    bool isAltDown = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
+
+                    // F-KEYS (Work regardless of Shift/Ctrl/Alt)
+                    // 0x75=F6, 0x76=F7, 0x77=F8, 0x78=F9, 0x79=F10, 0x7A=F11
+                    if (vkCode == 0x75) wnd.StopHuntTimer();
+                    else if (vkCode == 0x76) wnd.ResetHuntTimer();
+                    else if (vkCode == 0x77) wnd.StopSmudgeTimer();
+                    else if (vkCode == 0x78) wnd.ResetSmudgeTimer();
+                    else if (vkCode == 0x79) wnd.CalculateBPM();
+                    else if (vkCode == 0x7A) wnd.ResetPace();
+
+                    // VIEW KEYS
+                    else if (vkCode == 0x2D) wnd.SetViewMode(1); // Insert
+                    else if (vkCode == 0x24) wnd.SetViewMode(2); // Home
+
+                    // EVIDENCE KEYS (Alt + 1-8)
+                    // 0x31='1' ... 0x38='8'
+                    else if (isAltDown && vkCode >= 0x31 && vkCode <= 0x38)
+                    {
+                        if (vkCode == 0x38) wnd.ResetEvidence();
+                        else wnd.ToggleEvidenceByIndex(vkCode - 0x30);
+                    }
+                }
+            }
+            return CallNextHookEx(_hookID, nCode, wParam, lParam);
+        }
+
+        // --- NATIVE METHODS ---
+        [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+        private static extern IntPtr SetWindowsHookEx(int idHook, LowLevelKeyboardProc lpfn, IntPtr hMod, uint dwThreadId);
+
+        [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool UnhookWindowsHookEx(IntPtr hhk);
+
+        [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+        private static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+        private static extern IntPtr GetModuleHandle(string lpModuleName);
+
+        // Checks key state globally (even if game is focused)
+        [DllImport("user32.dll")]
+        private static extern short GetAsyncKeyState(int vKey);
+
+
+        // --- APP LOGIC ---
+        public List<Ghost> AllGhosts { get; set; }
+        private DispatcherTimer _smudgeTimer;
+        private int _timerSecondsRemaining = 180;
+        private DispatcherTimer _huntTimer;
+        private int _huntTimerSeconds = 25;
+        private List<DateTime> _tapHistory = new List<DateTime>();
+        private double _speedMultiplier = 1.0;
+        private int _currentView = 0;
+
+        private readonly List<string> _fastGhosts = new List<string> { "Jinn", "Revenant", "Hantu", "The Twins", "Raiju", "Moroi", "Deogen", "Thaye", "The Mimic" };
+        private readonly List<string> _slowGhosts = new List<string> { "Revenant", "Hantu", "Deogen", "Thaye", "The Mimic", "The Twins", "Moroi" };
+        private string _currentSpeedCategory = "None";
+
+        private void BtnDonate_Click(object sender, RoutedEventArgs e) { try { Process.Start(new ProcessStartInfo { FileName = "https://ko-fi.com/hopesan", UseShellExecute = true }); } catch { } }
 
         private void SetViewMode(int mode)
         {
@@ -134,20 +152,17 @@ namespace Hophesmoverlay
             else if (_currentView == 2) IntelHud.Visibility = Visibility.Visible;
         }
 
-        // --- RESET EVIDENCE (ALT+8) ---
         private void ResetEvidence()
         {
-            // Uncheck all boxes
             var checkBoxes = FindVisualChildren<CheckBox>(this);
             foreach (var box in checkBoxes) { box.IsChecked = false; }
-            // Update logic
             UpdateGhostFiltering();
         }
 
         private void ResetPace()
         {
             _tapHistory.Clear();
-            string txt = "-- BPM"; TxtBPM.Text = txt; TxtIntelBPM.Text = txt;
+            string txt = "-- m/s"; TxtBPM.Text = txt; TxtIntelBPM.Text = txt;
             TxtGhostSpeedGuess.Text = "Select Speed & Tap"; TxtIntelSpeedGuess.Text = "Waiting";
             TxtPacerStatus.Text = "FILTER: NONE"; TxtPacerStatus.Foreground = Brushes.Gray;
             _currentSpeedCategory = "None"; UpdateGhostFiltering();
@@ -162,44 +177,97 @@ namespace Hophesmoverlay
                 double avgInterval = totalIntervals / (_tapHistory.Count - 1);
                 if (avgInterval > 0)
                 {
-                    int rawBpm = (int)(60 / avgInterval); int normBpm = (int)(rawBpm / _speedMultiplier);
-                    string bpmText = $"{rawBpm} BPM"; TxtBPM.Text = bpmText; TxtIntelBPM.Text = bpmText; InterpretSpeed(normBpm);
+                    int rawBpm = (int)(60 / avgInterval);
+                    double ms = (rawBpm * 0.0148) / _speedMultiplier;
+                    string speedText = $"{ms:F1} m/s";
+                    TxtBPM.Text = speedText; TxtIntelBPM.Text = speedText;
+                    InterpretSpeed(ms);
                 }
             }
             else { TxtBPM.Text = "Tap..."; TxtIntelBPM.Text = "Tap..."; }
         }
 
-        private void InterpretSpeed(int normBpm)
+        private void InterpretSpeed(double ms)
         {
             string guess = ""; Brush c = Brushes.Gray; _currentSpeedCategory = "Normal";
-            if (normBpm < 85) { guess = "Rev (Slow)/Deo"; c = Brushes.Cyan; _currentSpeedCategory = "Slow"; }
-            else if (normBpm >= 85 && normBpm < 105) { guess = "Slightly Slow"; c = Brushes.LightGray; }
-            else if (normBpm >= 105 && normBpm <= 125) { guess = "Normal Speed"; c = Brushes.White; }
-            else if (normBpm > 125 && normBpm < 160) { guess = "Fast (Hantu/Moroi)"; c = Brushes.Orange; _currentSpeedCategory = "Fast"; }
-            else if (normBpm >= 160) { guess = "RUN (Raiju/Rev)"; c = Brushes.Red; _currentSpeedCategory = "Fast"; }
-            TxtGhostSpeedGuess.Text = guess; TxtGhostSpeedGuess.Foreground = c; TxtIntelSpeedGuess.Text = guess; TxtIntelSpeedGuess.Foreground = c;
-            TxtPacerStatus.Text = $"FILTER: {_currentSpeedCategory.ToUpper()}"; TxtPacerStatus.Foreground = c; UpdateGhostFiltering();
+            if (ms < 1.3) { guess = "Rev (Slow)/Deo"; c = Brushes.Cyan; _currentSpeedCategory = "Slow"; }
+            else if (ms >= 1.3 && ms < 1.6) { guess = "Slightly Slow"; c = Brushes.LightGray; }
+            else if (ms >= 1.6 && ms <= 1.8) { guess = "Normal Speed"; c = Brushes.White; }
+            else if (ms > 1.8 && ms < 2.5) { guess = "Fast (Hantu/Moroi)"; c = Brushes.Orange; _currentSpeedCategory = "Fast"; }
+            else if (ms >= 2.5) { guess = "RUN (Raiju/Rev)"; c = Brushes.Red; _currentSpeedCategory = "Fast"; }
+            TxtGhostSpeedGuess.Text = guess; TxtGhostSpeedGuess.Foreground = c;
+            TxtIntelSpeedGuess.Text = guess; TxtIntelSpeedGuess.Foreground = c;
+            TxtPacerStatus.Text = $"FILTER: {_currentSpeedCategory.ToUpper()}"; TxtPacerStatus.Foreground = c;
+            UpdateGhostFiltering();
         }
+
+        private void ToggleEvidenceByIndex(int index)
+        {
+            CheckBox t = null;
+            switch (index) { case 1: t = ChkEv1; break; case 2: t = ChkEv2; break; case 3: t = ChkEv3; break; case 4: t = ChkEv4; break; case 5: t = ChkEv5; break; case 6: t = ChkEv6; break; case 7: t = ChkEv7; break; }
+            if (t != null)
+            {
+                if (t.IsChecked == false) t.IsChecked = true; // Found
+                else if (t.IsChecked == true) t.IsChecked = null; // Ruled Out
+                else t.IsChecked = false; // Reset
+                UpdateGhostFiltering();
+            }
+        }
+
+        private void Evidence_Changed(object sender, RoutedEventArgs e) => UpdateGhostFiltering();
 
         private void UpdateGhostFiltering()
         {
             var checkBoxes = FindVisualChildren<CheckBox>(this);
-            List<string> selectedEv = new List<string>();
-            foreach (var box in checkBoxes) if (box.IsChecked == true) selectedEv.Add(box.Content.ToString());
+            List<string> foundEv = new List<string>();
+            List<string> ruledOutEv = new List<string>();
 
-            string summary = string.Join(" + ", selectedEv.Select(x => x.Replace("Ghost ", "").Replace("Level ", "").Replace("Spirit ", "")));
-            if (string.IsNullOrEmpty(summary)) summary = "NONE"; TxtIntelEvidence.Text = summary;
+            foreach (var box in checkBoxes)
+            {
+                if (box.IsChecked == true) foundEv.Add(box.Content.ToString());
+                if (box.IsChecked == null) ruledOutEv.Add(box.Content.ToString());
+            }
+
+            if (foundEv.Count > 0)
+            {
+                string foundStr = string.Join(" + ", foundEv.Select(x => x.Replace("Ghost ", "").Replace("Level ", "").Replace("Spirit ", "")));
+                TxtIntelFound.Text = foundStr; TxtIntelFound.Visibility = Visibility.Visible;
+            }
+            else if (ruledOutEv.Count > 0)
+            {
+                TxtIntelFound.Visibility = Visibility.Collapsed;
+            }
+            else
+            {
+                TxtIntelFound.Text = "WAITING..."; TxtIntelFound.Visibility = Visibility.Visible;
+            }
+
+            if (ruledOutEv.Count > 0)
+            {
+                string ruledOutStr = "NOT: " + string.Join(", ", ruledOutEv.Select(x => x.Replace("Ghost ", "").Replace("Level ", "").Replace("Spirit ", "")));
+                TxtIntelRuledOut.Text = ruledOutStr; TxtIntelRuledOut.Visibility = Visibility.Visible;
+            }
+            else
+            {
+                TxtIntelRuledOut.Visibility = Visibility.Collapsed;
+            }
 
             foreach (var ghost in AllGhosts)
             {
                 bool elim = false;
-
-                foreach (var ev in selectedEv)
+                foreach (var ev in foundEv)
                 {
-                    if (ghost.Name == "The Mimic" && ev == "Ghost Orb") { continue; }
+                    if (ghost.Name == "The Mimic" && ev == "Ghost Orb") continue;
                     if (!ghost.Evidences.Contains(ev)) { elim = true; break; }
                 }
-
+                if (!elim)
+                {
+                    foreach (var ev in ruledOutEv)
+                    {
+                        if (ghost.Evidences.Contains(ev)) { elim = true; break; }
+                        if (ghost.Name == "The Mimic" && ev == "Ghost Orb") { elim = true; break; }
+                    }
+                }
                 if (!elim)
                 {
                     if (_currentSpeedCategory == "Fast") { if (!_fastGhosts.Contains(ghost.Name)) elim = true; }
@@ -218,7 +286,6 @@ namespace Hophesmoverlay
             if (CmbSpeed.SelectedIndex == 0) _speedMultiplier = 0.5; else if (CmbSpeed.SelectedIndex == 1) _speedMultiplier = 0.75; else if (CmbSpeed.SelectedIndex == 2) _speedMultiplier = 1.0; else if (CmbSpeed.SelectedIndex == 3) _speedMultiplier = 1.25; else if (CmbSpeed.SelectedIndex == 4) _speedMultiplier = 1.5;
         }
 
-        // --- SMUDGE TIMER ---
         private void StartSmudgeTimer() { _timerSecondsRemaining = 180; ProgressTimer.Value = 180; _smudgeTimer.Start(); UpdateTimerDisplay(); }
         private void ResetSmudgeTimer() { StartSmudgeTimer(); }
         private void StopSmudgeTimer()
@@ -249,67 +316,28 @@ namespace Hophesmoverlay
             TxtIntelTimer.Text = timeText; TxtIntelTimer.Foreground = colorBrush; TxtIntelStatus.Text = statusText; TxtIntelStatus.Foreground = statusBrush;
         }
 
-        // --- HUNT COOLDOWN TIMER (NEW) ---
         private void ResetHuntTimer()
         {
-            _huntTimerSeconds = 25;
-            ProgressHuntTimer.Value = 25;
-            _huntTimer.Start();
-            UpdateHuntTimerDisplay();
+            _huntTimerSeconds = 25; ProgressHuntTimer.Value = 25; _huntTimer.Start(); UpdateHuntTimerDisplay();
+        }
+        private void StopHuntTimer()
+        {
+            _huntTimer.Stop(); TxtHuntTimer.Text = "READY"; TxtMiniHuntTimer.Text = "READY"; TxtIntelHuntTimer.Text = "READY"; TxtHuntTimerStatus.Text = "WAITING...";
+            TxtHuntTimer.Foreground = Brushes.White; TxtMiniHuntTimer.Foreground = Brushes.White; TxtIntelHuntTimer.Foreground = Brushes.White;
         }
         private void HuntTimer_Tick(object sender, EventArgs e)
         {
-            _huntTimerSeconds--;
-            ProgressHuntTimer.Value = _huntTimerSeconds;
-            UpdateHuntTimerDisplay();
-            if (_huntTimerSeconds <= 0)
-            {
-                _huntTimer.Stop();
-                PlayAudioCue("spirit"); // Recycle high beep for "Ready"
-                TxtHuntTimer.Text = "READY"; TxtMiniHuntTimer.Text = "READY"; TxtIntelHuntTimer.Text = "READY";
-                TxtHuntTimer.Foreground = Brushes.Red;
-            }
+            _huntTimerSeconds--; ProgressHuntTimer.Value = _huntTimerSeconds; UpdateHuntTimerDisplay();
+            if (_huntTimerSeconds <= 0) { _huntTimer.Stop(); PlayAudioCue("spirit"); TxtHuntTimer.Text = "READY"; TxtMiniHuntTimer.Text = "READY"; TxtIntelHuntTimer.Text = "READY"; TxtHuntTimer.Foreground = Brushes.Red; }
         }
         private void UpdateHuntTimerDisplay()
         {
-            TimeSpan t = TimeSpan.FromSeconds(_huntTimerSeconds);
-            string txt = string.Format("{0:D2}:{1:D2}", t.Minutes, t.Seconds);
-            Brush c = Brushes.White;
-            string status = "SAFE";
-
-            // LOGIC CORRECTION:
-            // Timer counts DOWN from 25.
-            // 25s down to 5s = Safe (0s to 20s elapsed).
-            // 5s down to 0s  = Demon Unsafe (20s to 25s elapsed).
-            // 0s             = Everyone Unsafe.
-
-            if (_huntTimerSeconds > 5)
-            {
-                c = Brushes.LightGreen; // Safe
-                status = "SAFE";
-            }
-            else if (_huntTimerSeconds > 0)
-            {
-                c = (Brush)new BrushConverter().ConvertFrom("#FF6666"); // Light Red
-                status = "DEMON!";
-            }
-            else
-            {
-                c = Brushes.Red;
-                status = "READY";
-            }
-
-            TxtHuntTimer.Text = txt; TxtHuntTimer.Foreground = c;
-            TxtMiniHuntTimer.Text = txt; TxtMiniHuntTimer.Foreground = c;
-            TxtIntelHuntTimer.Text = txt; TxtIntelHuntTimer.Foreground = c;
-
-            // Optional: If you want to see the status text in the HUD, you'd need to add TextBlocks for it, 
-            // but the color change is usually enough for "Pro" players.
+            TimeSpan t = TimeSpan.FromSeconds(_huntTimerSeconds); string txt = string.Format("{0:D2}:{1:D2}", t.Minutes, t.Seconds); Brush c = Brushes.White; string status = "SAFE";
+            if (_huntTimerSeconds > 5) { c = Brushes.LightGreen; status = "SAFE"; } else if (_huntTimerSeconds > 0) { c = (Brush)new BrushConverter().ConvertFrom("#FF6666"); status = "DEMON!"; } else { c = Brushes.Red; status = "READY"; }
+            TxtHuntTimer.Text = txt; TxtHuntTimer.Foreground = c; TxtMiniHuntTimer.Text = txt; TxtMiniHuntTimer.Foreground = c; TxtIntelHuntTimer.Text = txt; TxtIntelHuntTimer.Foreground = c; TxtHuntTimerStatus.Text = status; TxtHuntTimerStatus.Foreground = c;
         }
 
         private void PlayAudioCue(string type) { Task.Run(() => { try { if (type == "demon") { Console.Beep(200, 400); Thread.Sleep(100); Console.Beep(200, 400); } else if (type == "normal") { Console.Beep(500, 200); Thread.Sleep(100); Console.Beep(500, 200); Thread.Sleep(100); Console.Beep(500, 200); } else if (type == "spirit") { Console.Beep(1000, 300); Thread.Sleep(50); Console.Beep(1000, 300); Thread.Sleep(50); Console.Beep(1000, 800); } } catch { } }); }
-        private void ToggleEvidenceByIndex(int index) { CheckBox t = null; switch (index) { case 1: t = ChkEv1; break; case 2: t = ChkEv2; break; case 3: t = ChkEv3; break; case 4: t = ChkEv4; break; case 5: t = ChkEv5; break; case 6: t = ChkEv6; break; case 7: t = ChkEv7; break; } if (t != null) t.IsChecked = !t.IsChecked; }
-        private void Evidence_Changed(object sender, RoutedEventArgs e) => UpdateGhostFiltering();
         private void Window_MouseDown(object sender, MouseButtonEventArgs e) { if (e.ChangedButton == MouseButton.Left) DragMove(); if (e.ChangedButton == MouseButton.Right) Application.Current.Shutdown(); }
         public static IEnumerable<T> FindVisualChildren<T>(DependencyObject depObj) where T : DependencyObject { if (depObj != null) for (int i = 0; i < VisualTreeHelper.GetChildrenCount(depObj); i++) { DependencyObject child = VisualTreeHelper.GetChild(depObj, i); if (child != null && child is T) yield return (T)child; foreach (T childOfChild in FindVisualChildren<T>(child)) yield return childOfChild; } }
 
