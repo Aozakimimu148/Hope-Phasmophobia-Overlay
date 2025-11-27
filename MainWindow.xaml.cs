@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.ComponentModel;
 using System.Linq;
 using System.Runtime.InteropServices;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
@@ -16,17 +17,30 @@ namespace Hophesmoverlay
 {
     public partial class MainWindow : Window
     {
-        [DllImport("user32.dll")] private static extern bool RegisterHotKey(IntPtr hWnd, int id, uint fsModifiers, uint vk);
-        [DllImport("user32.dll")] private static extern bool UnregisterHotKey(IntPtr hWnd, int id);
+        // --- NATIVE METHODS ---
         [DllImport("user32.dll")] private static extern short GetAsyncKeyState(int vKey);
 
-        private const int WH_KEYBOARD_LL = 13; private const int WM_KEYDOWN = 0x0100; private const int WM_SYSKEYDOWN = 0x0104;
-        private const int VK_MENU = 0x12;
-        private static LowLevelKeyboardProc _proc = HookCallback;
-        private static IntPtr _hookID = IntPtr.Zero;
-        private LowLevelKeyboardProc _procReference;
+        // --- KEYS ---
+        private const int VK_MENU = 0x12; // Alt
+        private const int VK_F6 = 0x75;
+        private const int VK_F7 = 0x76;
+        private const int VK_F8 = 0x77;
+        private const int VK_F9 = 0x78;
+        private const int VK_F10 = 0x79;
+        private const int VK_F11 = 0x7A;
+        private const int VK_INSERT = 0x2D;
+        private const int VK_HOME = 0x24;
 
+        // --- THREADING ---
+        private CancellationTokenSource _cancellationTokenSource;
+        private Dictionary<int, bool> _keyStateTracker = new Dictionary<int, bool>();
+
+        // --- APP STATE ---
         public List<Ghost> AllGhosts { get; set; }
+
+        // OPTIMIZATION: Cache the checkboxes so we don't search for them every click
+        private List<CheckBox> _evidenceCheckBoxes = new List<CheckBox>();
+
         private DispatcherTimer _smudgeTimer;
         private int _timerSecondsRemaining = 180;
         private DispatcherTimer _huntTimer;
@@ -35,16 +49,26 @@ namespace Hophesmoverlay
         private double _speedMultiplier = 1.0;
         private int _currentView = 0;
         private string _currentLang = "EN";
+        private string _currentSpeedCategory = "None";
 
         private readonly List<string> _fastGhosts = new List<string> { "Jinn", "Revenant", "Hantu", "The Twins", "Raiju", "Moroi", "Deogen", "Thaye", "The Mimic" };
         private readonly List<string> _slowGhosts = new List<string> { "Revenant", "Hantu", "Deogen", "Thaye", "The Mimic", "The Twins", "Moroi" };
-        private string _currentSpeedCategory = "None";
 
         public MainWindow()
         {
             InitializeComponent();
-            _procReference = HookCallback;
-            _hookID = SetHook(_procReference);
+
+            // OPTIMIZATION 1: Boost Priority slightly so Game doesn't starve the input
+            Process.GetCurrentProcess().PriorityClass = ProcessPriorityClass.AboveNormal;
+
+            // OPTIMIZATION 2: Cache UI Elements immediately
+            _evidenceCheckBoxes.Add(ChkEv1);
+            _evidenceCheckBoxes.Add(ChkEv2);
+            _evidenceCheckBoxes.Add(ChkEv3);
+            _evidenceCheckBoxes.Add(ChkEv4);
+            _evidenceCheckBoxes.Add(ChkEv5);
+            _evidenceCheckBoxes.Add(ChkEv6);
+            _evidenceCheckBoxes.Add(ChkEv7);
 
             InitializeGhosts("EN");
             GhostsListControl.ItemsSource = AllGhosts;
@@ -57,97 +81,76 @@ namespace Hophesmoverlay
             _huntTimer = new DispatcherTimer(DispatcherPriority.Render);
             _huntTimer.Interval = TimeSpan.FromSeconds(1);
             _huntTimer.Tick += HuntTimer_Tick;
+
+            // START BACKGROUND INPUT THREAD
+            _cancellationTokenSource = new CancellationTokenSource();
+            Task.Factory.StartNew(() => InputLoop(_cancellationTokenSource.Token), TaskCreationOptions.LongRunning);
         }
 
-        private void BtnDonate_Click(object sender, RoutedEventArgs e) { try { Process.Start(new ProcessStartInfo { FileName = "https://ko-fi.com/hopesan", UseShellExecute = true }); } catch { } }
+        // --- BACKGROUND INPUT LOOP ---
+        private void InputLoop(CancellationToken token)
+        {
+            while (!token.IsCancellationRequested)
+            {
+                // Check Keys
+                CheckKey(VK_F6, () => StopHuntTimer());
+                CheckKey(VK_F7, () => ResetHuntTimer());
+                CheckKey(VK_F8, () => StopSmudgeTimer());
+                CheckKey(VK_F9, () => ResetSmudgeTimer());
+                CheckKey(VK_F10, () => CalculateBPM());
+                CheckKey(VK_F11, () => ResetPace());
+                CheckKey(VK_INSERT, () => SetViewMode(1));
+                CheckKey(VK_HOME, () => SetViewMode(2));
 
-        // --- MENU LOGIC ---
+                bool isAltDown = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
+                if (isAltDown)
+                {
+                    for (int i = 1; i <= 8; i++)
+                    {
+                        int vKey = 0x30 + i;
+                        // Capture index for lambda
+                        int idx = i;
+                        CheckKey(vKey, () =>
+                        {
+                            if (idx == 8) ResetEvidence();
+                            else ToggleEvidenceByIndex(idx);
+                        });
+                    }
+                }
+
+                Thread.Sleep(10);
+            }
+        }
+
+        private void CheckKey(int key, Action action)
+        {
+            bool isDown = (GetAsyncKeyState(key) & 0x8000) != 0;
+
+            if (!_keyStateTracker.ContainsKey(key)) _keyStateTracker[key] = false;
+
+            if (isDown && !_keyStateTracker[key])
+            {
+                _keyStateTracker[key] = true;
+                // CHANGE: 'Send' priority forces the UI to update immediately, skipping the queue.
+                Dispatcher.InvokeAsync(action, DispatcherPriority.Send);
+            }
+            else if (!isDown && _keyStateTracker[key])
+            {
+                _keyStateTracker[key] = false;
+            }
+        }
+        protected override void OnClosed(EventArgs e)
+        {
+            _cancellationTokenSource.Cancel();
+            base.OnClosed(e);
+        }
+
+        // --- UI LOGIC ---
+        private void BtnDonate_Click(object sender, RoutedEventArgs e) { try { Process.Start(new ProcessStartInfo { FileName = "https://ko-fi.com/hopesan", UseShellExecute = true }); } catch { } }
+        private void Window_MouseDown(object sender, MouseButtonEventArgs e) { if (e.ChangedButton == MouseButton.Left) DragMove(); }
         private void MenuEn_Click(object sender, RoutedEventArgs e) => SetLanguage("EN");
         private void MenuPt_Click(object sender, RoutedEventArgs e) => SetLanguage("PT");
         private void MenuExit_Click(object sender, RoutedEventArgs e) { Application.Current.Shutdown(); }
-
-        // --- MOUSE LOGIC ---
-        private void Window_MouseDown(object sender, MouseButtonEventArgs e)
-        {
-            if (e.ChangedButton == MouseButton.Left) this.DragMove();
-        }
-
-        private void SetLanguage(string lang)
-        {
-            _currentLang = lang;
-            InitializeGhosts(lang);
-            GhostsListControl.ItemsSource = null; GhostsListControl.ItemsSource = AllGhosts;
-            GhostsIntelControl.ItemsSource = null; GhostsIntelControl.ItemsSource = AllGhosts;
-
-            if (lang == "PT")
-            {
-                LblControls.Text = "[INS] MINI | [HOME] INTEL | [ALT+8] RESETAR";
-                LblEvidence.Text = "EVIDÊNCIA (ALT+1-7)";
-                LblSmudge.Text = "INCENSO [F9]"; LblHunt.Text = "CAÇADA [F7]"; LblSpeed.Text = "VELOCIDADE (m/s)";
-                LblMiniSmudge.Text = "INCENSO"; LblMiniHunt.Text = "CAÇADA";
-                LblIntelSmudge.Text = "INCENSO"; LblIntelHunt.Text = "CAÇADA"; LblIntelSpeed.Text = "VELOC.";
-                LblIntelEvidence.Text = "EVIDÊNCIA MARCADA"; LblIntelTargets.Text = "FANTASMAS POSSÍVEIS";
-                TxtGhostSpeedGuess.Text = "Toque no ritmo dos passos";
-                ChkEv1.Content = "EMF Nível 5"; ChkEv2.Content = "Spirit Box"; ChkEv3.Content = "Impressão Digital";
-                ChkEv4.Content = "Orbe Fantasma"; ChkEv5.Content = "Escrita Fantasma"; ChkEv6.Content = "Temperatura Baixa"; ChkEv7.Content = "D.O.T.S.";
-            }
-            else
-            {
-                LblControls.Text = "[INS] MINI | [HOME] INTEL | [ALT+8] RESET";
-                LblEvidence.Text = "EVIDENCE (ALT+1-7)";
-                LblSmudge.Text = "SMUDGE [F9]"; LblHunt.Text = "HUNT CD [F7]"; LblSpeed.Text = "SPEED (m/s)";
-                LblMiniSmudge.Text = "SMUDGE"; LblMiniHunt.Text = "HUNT CD";
-                LblIntelSmudge.Text = "SMUDGE"; LblIntelHunt.Text = "HUNT CD"; LblIntelSpeed.Text = "SPEED";
-                LblIntelEvidence.Text = "MARKED EVIDENCE"; LblIntelTargets.Text = "POSSIBLE TARGETS";
-                TxtGhostSpeedGuess.Text = "Select Speed & Tap";
-                ChkEv1.Content = "EMF Level 5"; ChkEv2.Content = "Spirit Box"; ChkEv3.Content = "Fingerprints";
-                ChkEv4.Content = "Ghost Orb"; ChkEv5.Content = "Ghost Writing"; ChkEv6.Content = "Freezing"; ChkEv7.Content = "D.O.T.S.";
-            }
-            UpdateGhostFiltering();
-        }
-
-        private static IntPtr SetHook(LowLevelKeyboardProc proc)
-        {
-            using (Process curProcess = Process.GetCurrentProcess())
-            using (ProcessModule curModule = curProcess.MainModule)
-            {
-                return SetWindowsHookEx(WH_KEYBOARD_LL, proc, GetModuleHandle(curModule.ModuleName), 0);
-            }
-        }
-        private delegate IntPtr LowLevelKeyboardProc(int nCode, IntPtr wParam, IntPtr lParam);
-        private static IntPtr HookCallback(int nCode, IntPtr wParam, IntPtr lParam)
-        {
-            if (nCode >= 0 && (wParam == (IntPtr)WM_KEYDOWN || wParam == (IntPtr)WM_SYSKEYDOWN))
-            {
-                int vkCode = Marshal.ReadInt32(lParam);
-                var wnd = Application.Current.MainWindow as MainWindow;
-                if (wnd != null)
-                {
-                    bool isAltDown = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
-                    if (vkCode == 0x75) wnd.StopHuntTimer();
-                    else if (vkCode == 0x76) wnd.ResetHuntTimer();
-                    else if (vkCode == 0x77) wnd.StopSmudgeTimer();
-                    else if (vkCode == 0x78) wnd.ResetSmudgeTimer();
-                    else if (vkCode == 0x79) wnd.CalculateBPM();
-                    else if (vkCode == 0x7A) wnd.ResetPace();
-                    else if (vkCode == 0x2D) wnd.SetViewMode(1);
-                    else if (vkCode == 0x24) wnd.SetViewMode(2);
-                    else if (isAltDown && vkCode >= 0x31 && vkCode <= 0x38)
-                    {
-                        if (vkCode == 0x38) wnd.ResetEvidence();
-                        else wnd.ToggleEvidenceByIndex(vkCode - 0x30);
-                    }
-                }
-            }
-            return CallNextHookEx(_hookID, nCode, wParam, lParam);
-        }
-
-        [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)] private static extern IntPtr SetWindowsHookEx(int idHook, LowLevelKeyboardProc lpfn, IntPtr hMod, uint dwThreadId);
-        [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)][return: MarshalAs(UnmanagedType.Bool)] private static extern bool UnhookWindowsHookEx(IntPtr hhk);
-        [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)] private static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
-        [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)] private static extern IntPtr GetModuleHandle(string lpModuleName);
-
-        protected override void OnClosed(EventArgs e) { UnhookWindowsHookEx(_hookID); base.OnClosed(e); }
 
         private void SetViewMode(int mode)
         {
@@ -160,8 +163,8 @@ namespace Hophesmoverlay
 
         private void ResetEvidence()
         {
-            var checkBoxes = FindVisualChildren<CheckBox>(this);
-            foreach (var box in checkBoxes) { box.IsChecked = false; }
+            // OPTIMIZATION: Use Cached List instead of FindVisualChildren
+            foreach (var box in _evidenceCheckBoxes) { box.IsChecked = false; }
             UpdateGhostFiltering();
         }
 
@@ -194,11 +197,18 @@ namespace Hophesmoverlay
         private void InterpretSpeed(double ms)
         {
             string guess = ""; Brush c = Brushes.Gray; _currentSpeedCategory = "Normal";
-            if (ms < 1.3) { guess = (_currentLang == "PT") ? "Rev (Lento)/Deo" : "Rev (Slow)/Deo"; c = Brushes.Cyan; _currentSpeedCategory = "Slow"; }
-            else if (ms >= 1.3 && ms < 1.6) { guess = (_currentLang == "PT") ? "Lento" : "Slightly Slow"; c = Brushes.LightGray; }
-            else if (ms >= 1.6 && ms <= 1.8) { guess = (_currentLang == "PT") ? "Normal" : "Normal Speed"; c = Brushes.White; }
-            else if (ms > 1.8 && ms < 2.5) { guess = (_currentLang == "PT") ? "Rápido (Hantu/Moroi)" : "Fast (Hantu/Moroi)"; c = Brushes.Orange; _currentSpeedCategory = "Fast"; }
-            else if (ms >= 2.5) { guess = (_currentLang == "PT") ? "CORRA (Raiju/Rev)" : "RUN (Raiju/Rev)"; c = Brushes.Red; _currentSpeedCategory = "Fast"; }
+            string slowTxt = (_currentLang == "PT") ? "Rev (Lento)/Deo" : "Rev (Slow)/Deo";
+            string slightSlowTxt = (_currentLang == "PT") ? "Lento" : "Slightly Slow";
+            string normTxt = (_currentLang == "PT") ? "Normal" : "Normal Speed";
+            string fastTxt = (_currentLang == "PT") ? "Rápido (Hantu/Moroi)" : "Fast (Hantu/Moroi)";
+            string runTxt = (_currentLang == "PT") ? "CORRA (Raiju/Rev)" : "RUN (Raiju/Rev)";
+
+            if (ms < 1.3) { guess = slowTxt; c = Brushes.Cyan; _currentSpeedCategory = "Slow"; }
+            else if (ms >= 1.3 && ms < 1.6) { guess = slightSlowTxt; c = Brushes.LightGray; }
+            else if (ms >= 1.6 && ms <= 1.8) { guess = normTxt; c = Brushes.White; }
+            else if (ms > 1.8 && ms < 2.5) { guess = fastTxt; c = Brushes.Orange; _currentSpeedCategory = "Fast"; }
+            else if (ms >= 2.5) { guess = runTxt; c = Brushes.Red; _currentSpeedCategory = "Fast"; }
+
             TxtGhostSpeedGuess.Text = guess; TxtGhostSpeedGuess.Foreground = c;
             TxtIntelSpeedGuess.Text = guess; TxtIntelSpeedGuess.Foreground = c;
             TxtPacerStatus.Text = $"FILTER: {_currentSpeedCategory.ToUpper()}"; TxtPacerStatus.Foreground = c;
@@ -207,20 +217,28 @@ namespace Hophesmoverlay
 
         private void ToggleEvidenceByIndex(int index)
         {
-            CheckBox t = null;
-            switch (index) { case 1: t = ChkEv1; break; case 2: t = ChkEv2; break; case 3: t = ChkEv3; break; case 4: t = ChkEv4; break; case 5: t = ChkEv5; break; case 6: t = ChkEv6; break; case 7: t = ChkEv7; break; }
-            if (t != null) { if (t.IsChecked == false) t.IsChecked = true; else if (t.IsChecked == true) t.IsChecked = null; else t.IsChecked = false; UpdateGhostFiltering(); }
+            // OPTIMIZATION: Access List directly
+            if (index < 1 || index > _evidenceCheckBoxes.Count) return;
+
+            var t = _evidenceCheckBoxes[index - 1]; // Index is 1-based, List is 0-based
+
+            if (t.IsChecked == false) t.IsChecked = true;
+            else if (t.IsChecked == true) t.IsChecked = null;
+            else t.IsChecked = false;
+
+            UpdateGhostFiltering();
         }
 
         private void Evidence_Changed(object sender, RoutedEventArgs e) => UpdateGhostFiltering();
 
+        // --- OPTIMIZED FILTERING ---
         private void UpdateGhostFiltering()
         {
-            var checkBoxes = FindVisualChildren<CheckBox>(this);
+            // Use Cached List
             List<string> foundEv = new List<string>();
             List<string> ruledOutEv = new List<string>();
 
-            foreach (var box in checkBoxes)
+            foreach (var box in _evidenceCheckBoxes)
             {
                 if (box.IsChecked == true) foundEv.Add(box.Content.ToString());
                 if (box.IsChecked == null) ruledOutEv.Add(box.Content.ToString());
@@ -292,7 +310,7 @@ namespace Hophesmoverlay
 
         private void BtnStopSmudge_Click(object sender, RoutedEventArgs e) => StopSmudgeTimer();
         private void BtnResetSmudge_Click(object sender, RoutedEventArgs e) => ResetSmudgeTimer();
-
+        private void BtnResetPace_Click(object sender, RoutedEventArgs e) => ResetPace();
         private void CmbSpeed_SelectionChanged(object sender, SelectionChangedEventArgs e)
         {
             if (CmbSpeed.SelectedIndex == 0) _speedMultiplier = 0.5; else if (CmbSpeed.SelectedIndex == 1) _speedMultiplier = 0.75; else if (CmbSpeed.SelectedIndex == 2) _speedMultiplier = 1.0; else if (CmbSpeed.SelectedIndex == 3) _speedMultiplier = 1.25; else if (CmbSpeed.SelectedIndex == 4) _speedMultiplier = 1.5;
@@ -300,7 +318,6 @@ namespace Hophesmoverlay
 
         private void StartSmudgeTimer() { _timerSecondsRemaining = 180; ProgressTimer.Value = 180; _smudgeTimer.Start(); UpdateTimerDisplay(); }
         private void ResetSmudgeTimer() { StartSmudgeTimer(); }
-        private void BtnResetPace_Click(object sender, RoutedEventArgs e) => ResetPace();
         private void StopSmudgeTimer()
         {
             _smudgeTimer.Stop();
@@ -359,12 +376,26 @@ namespace Hophesmoverlay
             string safeTxt = (_currentLang == "PT") ? "SEGURO" : "SAFE";
             string demonTxt = "DEMON!";
             string readyTxt = (_currentLang == "PT") ? "PRONTO" : "READY";
-
             if (_huntTimerSeconds > 5) { c = Brushes.LightGreen; status = safeTxt; } else if (_huntTimerSeconds > 0) { c = (Brush)new BrushConverter().ConvertFrom("#FF6666"); status = demonTxt; } else { c = Brushes.Red; status = readyTxt; }
             TxtHuntTimer.Text = txt; TxtHuntTimer.Foreground = c; TxtMiniHuntTimer.Text = txt; TxtMiniHuntTimer.Foreground = c; TxtIntelHuntTimer.Text = txt; TxtIntelHuntTimer.Foreground = c; TxtHuntTimerStatus.Text = status; TxtHuntTimerStatus.Foreground = c;
         }
 
         private void PlayAudioCue(string type) { Task.Run(() => { try { if (type == "demon") { Console.Beep(200, 400); Thread.Sleep(100); Console.Beep(200, 400); } else if (type == "normal") { Console.Beep(500, 200); Thread.Sleep(100); Console.Beep(500, 200); Thread.Sleep(100); Console.Beep(500, 200); } else if (type == "spirit") { Console.Beep(1000, 300); Thread.Sleep(50); Console.Beep(1000, 300); Thread.Sleep(50); Console.Beep(1000, 800); } } catch { } }); }
+
+        private void SetLanguage(string lang)
+        {
+            _currentLang = lang; InitializeGhosts(lang); GhostsListControl.ItemsSource = null; GhostsListControl.ItemsSource = AllGhosts; GhostsIntelControl.ItemsSource = null; GhostsIntelControl.ItemsSource = AllGhosts;
+            if (lang == "PT")
+            {
+                LblControls.Text = "[INS] MINI | [HOME] INTEL | [ALT+8] RESETAR"; LblEvidence.Text = "EVIDÊNCIA (ALT+1-7)"; LblSmudge.Text = "INCENSO [F9]"; LblHunt.Text = "CAÇADA [F7]"; LblSpeed.Text = "VELOCIDADE (m/s)"; LblMiniSmudge.Text = "INCENSO"; LblMiniHunt.Text = "CAÇADA"; LblIntelSmudge.Text = "INCENSO"; LblIntelHunt.Text = "CAÇADA"; LblIntelSpeed.Text = "VELOC."; LblIntelEvidence.Text = "EVIDÊNCIA MARCADA"; LblIntelTargets.Text = "FANTASMAS POSSÍVEIS"; TxtGhostSpeedGuess.Text = "Toque no ritmo dos passos"; ChkEv1.Content = "EMF Nível 5"; ChkEv2.Content = "Spirit Box"; ChkEv3.Content = "Impressão Digital"; ChkEv4.Content = "Orbe Fantasma"; ChkEv5.Content = "Escrita Fantasma"; ChkEv6.Content = "Temperatura Baixa"; ChkEv7.Content = "D.O.T.S.";
+            }
+            else
+            {
+                LblControls.Text = "[INS] MINI | [HOME] INTEL | [ALT+8] RESET"; LblEvidence.Text = "EVIDENCE (ALT+1-7)"; LblSmudge.Text = "SMUDGE [F9]"; LblHunt.Text = "HUNT CD [F7]"; LblSpeed.Text = "SPEED (m/s)"; LblMiniSmudge.Text = "SMUDGE"; LblMiniHunt.Text = "HUNT CD"; LblIntelSmudge.Text = "SMUDGE"; LblIntelHunt.Text = "HUNT CD"; LblIntelSpeed.Text = "SPEED"; LblIntelEvidence.Text = "MARKED EVIDENCE"; LblIntelTargets.Text = "POSSIBLE TARGETS"; TxtGhostSpeedGuess.Text = "Select Speed & Tap"; ChkEv1.Content = "EMF Level 5"; ChkEv2.Content = "Spirit Box"; ChkEv3.Content = "Fingerprints"; ChkEv4.Content = "Ghost Orb"; ChkEv5.Content = "Ghost Writing"; ChkEv6.Content = "Freezing"; ChkEv7.Content = "D.O.T.S.";
+            }
+            UpdateGhostFiltering();
+        }
+
         public static IEnumerable<T> FindVisualChildren<T>(DependencyObject depObj) where T : DependencyObject { if (depObj != null) for (int i = 0; i < VisualTreeHelper.GetChildrenCount(depObj); i++) { DependencyObject child = VisualTreeHelper.GetChild(depObj, i); if (child != null && child is T) yield return (T)child; foreach (T childOfChild in FindVisualChildren<T>(child)) yield return childOfChild; } }
 
         private void InitializeGhosts(string lang = "EN")
@@ -438,57 +469,13 @@ namespace Hophesmoverlay
         public string Tell { get; set; }
         private bool _isEliminated;
         public bool IsEliminated { get => _isEliminated; set { _isEliminated = value; PropertyChanged?.Invoke(this, new PropertyChangedEventArgs("IsEliminated")); } }
-
         public Brush PrimaryColorBrush { get { return (Brush)new BrushConverter().ConvertFrom(PrimaryColor); } }
-        public string PrimaryColor
-        {
-            get
-            {
-                if (Evidences.Contains("Freezing") || Evidences.Contains("Temperatura Baixa")) return "#00CED1";
-                if (Evidences.Contains("EMF Level 5") || Evidences.Contains("EMF Nível 5")) return "#DC143C";
-                if (Evidences.Contains("D.O.T.S.")) return "#39FF14";
-                if (Evidences.Contains("Fingerprints") || Evidences.Contains("Impressão Digital")) return "#8A2BE2";
-                if (Evidences.Contains("Spirit Box")) return "#FF4500";
-                if (Evidences.Contains("Ghost Writing") || Evidences.Contains("Escrita Fantasma")) return "#FFD700";
-                return "#E0FFFF";
-            }
-        }
-
-        public Brush EvidenceGradient
-        {
-            get
-            {
-                var stops = new GradientStopCollection();
-                Color GetColor(string ev)
-                {
-                    if (ev.Contains("EMF")) return Color.FromRgb(220, 20, 60);
-                    if (ev.Contains("Fingerprints") || ev.Contains("Digital")) return Color.FromRgb(138, 43, 226);
-                    if (ev.Contains("Freezing") || ev.Contains("Gelado") || ev.Contains("Baixa")) return Color.FromRgb(0, 206, 209);
-                    if (ev.Contains("Spirit Box")) return Color.FromRgb(255, 69, 0);
-                    if (ev.Contains("Ghost Orb") || ev.Contains("Orbe")) return Color.FromRgb(224, 255, 255);
-                    if (ev.Contains("Writing") || ev.Contains("Escrita")) return Color.FromRgb(255, 215, 0);
-                    if (ev.Contains("D.O.T.S.")) return Color.FromRgb(57, 255, 20);
-                    return Colors.White;
-                }
-                if (Evidences.Count >= 1) stops.Add(new GradientStop(GetColor(Evidences[0]), 0.0));
-                if (Evidences.Count >= 2) stops.Add(new GradientStop(GetColor(Evidences[1]), 0.5));
-                if (Evidences.Count >= 3) stops.Add(new GradientStop(GetColor(Evidences[2]), 1.0));
-                return new LinearGradientBrush(stops, new Point(0, 0), new Point(1, 0)) { Opacity = 0.9 };
-            }
-        }
-
+        public string PrimaryColor { get { if (Evidences.Contains("Freezing") || Evidences.Contains("Temperatura Baixa")) return "#00CED1"; if (Evidences.Contains("EMF Level 5") || Evidences.Contains("EMF Nível 5")) return "#DC143C"; if (Evidences.Contains("D.O.T.S.")) return "#39FF14"; if (Evidences.Contains("Fingerprints") || Evidences.Contains("Impressão Digital")) return "#8A2BE2"; if (Evidences.Contains("Spirit Box")) return "#FF4500"; if (Evidences.Contains("Ghost Writing") || Evidences.Contains("Escrita Fantasma")) return "#FFD700"; return "#E0FFFF"; } }
+        public Brush EvidenceGradient { get { var stops = new GradientStopCollection(); Color GetColor(string ev) { if (ev.Contains("EMF")) return Color.FromRgb(220, 20, 60); if (ev.Contains("Fingerprints") || ev.Contains("Digital")) return Color.FromRgb(138, 43, 226); if (ev.Contains("Freezing") || ev.Contains("Gelado") || ev.Contains("Baixa")) return Color.FromRgb(0, 206, 209); if (ev.Contains("Spirit Box")) return Color.FromRgb(255, 69, 0); if (ev.Contains("Ghost Orb") || ev.Contains("Orbe")) return Color.FromRgb(224, 255, 255); if (ev.Contains("Writing") || ev.Contains("Escrita")) return Color.FromRgb(255, 215, 0); if (ev.Contains("D.O.T.S.")) return Color.FromRgb(57, 255, 20); return Colors.White; } if (Evidences.Count >= 1) stops.Add(new GradientStop(GetColor(Evidences[0]), 0.0)); if (Evidences.Count >= 2) stops.Add(new GradientStop(GetColor(Evidences[1]), 0.5)); if (Evidences.Count >= 3) stops.Add(new GradientStop(GetColor(Evidences[2]), 1.0)); return new LinearGradientBrush(stops, new Point(0, 0), new Point(1, 0)) { Opacity = 0.9 }; } }
         public Ghost(string n, string s, params string[] e) { Name = n; Symbol = s; Evidences = e.ToList(); }
         public event PropertyChangedEventHandler PropertyChanged;
     }
 
-    public class BooleanToVisibilityConverter : System.Windows.Data.IValueConverter
-    {
-        public object Convert(object v, Type t, object p, System.Globalization.CultureInfo c) => (bool)v ? Visibility.Visible : Visibility.Collapsed;
-        public object ConvertBack(object v, Type t, object p, System.Globalization.CultureInfo c) => throw new NotImplementedException();
-    }
-    public class InverseBooleanToVisibilityConverter : System.Windows.Data.IValueConverter
-    {
-        public object Convert(object v, Type t, object p, System.Globalization.CultureInfo c) => (bool)v ? Visibility.Collapsed : Visibility.Visible;
-        public object ConvertBack(object v, Type t, object p, System.Globalization.CultureInfo c) => throw new NotImplementedException();
-    }
+    public class BooleanToVisibilityConverter : System.Windows.Data.IValueConverter { public object Convert(object v, Type t, object p, System.Globalization.CultureInfo c) => (bool)v ? Visibility.Visible : Visibility.Collapsed; public object ConvertBack(object v, Type t, object p, System.Globalization.CultureInfo c) => throw new NotImplementedException(); }
+    public class InverseBooleanToVisibilityConverter : System.Windows.Data.IValueConverter { public object Convert(object v, Type t, object p, System.Globalization.CultureInfo c) => (bool)v ? Visibility.Collapsed : Visibility.Visible; public object ConvertBack(object v, Type t, object p, System.Globalization.CultureInfo c) => throw new NotImplementedException(); }
 }
